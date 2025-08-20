@@ -26,6 +26,8 @@ pub mod raw;
 pub mod tcp;
 #[cfg(feature = "socket-udp")]
 pub mod udp;
+//#[cfg(feature = "socket-vtcp")]
+pub mod vtcp;
 
 #[cfg(feature = "async")]
 mod waker;
