@@ -1,12 +1,11 @@
 use crate::time::{Duration, Instant};
 
-use crate::socket::tcp::State;
+use crate::socket::tcp::{SocketBuffer, State};
 use crate::socket::PollAt;
 use crate::wire::{TcpSeqNumber, IpEndpoint, IpListenEndpoint};
 use crate::storage::Assembler;
 
 mod congestion;
-
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -17,7 +16,7 @@ pub struct Tuple {
 /// Connection Management - TCP state machine and connection info
 /// Only Control Logic can modify this
 #[derive(Debug)]
-pub struct ConnectionManagement {
+pub struct ConnectionManagementState {
     /// TCP state (CLOSED, LISTEN, ESTABLISHED, etc.)
     pub tcp_state: State,
     pub listen_endpoint: IpListenEndpoint,
@@ -25,10 +24,11 @@ pub struct ConnectionManagement {
     pub timeout: Option<Duration>,
     pub keep_alive: Option<Duration>,
     pub hop_limit: Option<Duration>,
-    pub rx_fin_receieved: bool,
+    pub rx_fin_received: bool,
+    pub challenge_ack_timer: Instant,     // Rate limiting timer
 }
 
-impl Default for ConnectionManagement {
+impl Default for ConnectionManagementState {
     fn default() -> Self {
         Self {
             tcp_state: State::Established,
@@ -37,7 +37,8 @@ impl Default for ConnectionManagement {
             timeout: None,
             keep_alive: None,
             hop_limit: None,
-            rx_fin_receieved: false,
+            rx_fin_received: false,
+            challenge_ack_timer: Instant::now(),
         }
     }
 }
@@ -164,7 +165,7 @@ impl RttEstimator {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-enum Timer {
+pub enum Timer {
     Idle {
         keep_alive_at: Option<Instant>,
     },
@@ -271,7 +272,7 @@ impl Timer {
         }
     }
 
-    fn set_for_fast_retransmit(&mut self) {
+    pub fn set_for_fast_retransmit(&mut self) {
         *self = Timer::FastRetransmit
     }
 
@@ -316,7 +317,9 @@ impl Timer {
 /// Reliable & Ordered Delivery - Sequence numbers and ACK tracking
 /// Data Path can modify this
 #[derive(Debug)]
-pub struct ReliableOrderedDelivery {
+pub struct ReliableOrderedDeliveryState<'a> {
+    pub rx_buffer: SocketBuffer<'a>,
+    pub tx_buffer: SocketBuffer<'a>,
     pub local_seq_no: TcpSeqNumber,
     pub remote_seq_no: TcpSeqNumber,
     pub remote_last_seq: TcpSeqNumber,
@@ -327,11 +330,15 @@ pub struct ReliableOrderedDelivery {
     pub assembler: Assembler,
     pub timer: Timer,
     pub rtte: RttEstimator,
+    pub ack_delay: Option<Duration>,      // ACK delay duration
+    pub ack_delay_timer: AckDelayTimer,   // Delayed ACK timer
 }
 
-impl Default for ReliableOrderedDelivery {
-    fn default() -> Self {
+impl<'a> ReliableOrderedDeliveryState<'a> {
+    fn new(rx_buffer: SocketBuffer<'a>, tx_buffer: SocketBuffer<'a>) -> Self {
         Self {
+            rx_buffer,
+            tx_buffer,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
             remote_last_seq: TcpSeqNumber::default(),
@@ -342,6 +349,8 @@ impl Default for ReliableOrderedDelivery {
             assembler: Assembler::new(),
             timer: Timer::new(),
             rtte: RttEstimator::default(),
+            ack_delay: Some(ACK_DELAY_DEFAULT),
+            ack_delay_timer: AckDelayTimer::Idle,
         }
     }
 }
@@ -361,9 +370,6 @@ pub struct FlowControlState {
     pub remote_win_len: usize,            // Current remote window size  
     pub remote_win_shift: u8,             // Local window scaling factor
     pub remote_win_scale: Option<u8>,     // Remote window scaling
-    pub ack_delay: Option<Duration>,      // ACK delay duration
-    pub ack_delay_timer: AckDelayTimer,   // Delayed ACK timer
-    pub challenge_ack_timer: Instant,     // Rate limiting timer
 }
 
 impl Default for FlowControlState {
@@ -373,9 +379,6 @@ impl Default for FlowControlState {
             remote_win_len: 0,
             remote_win_shift: 0,
             remote_win_scale: None,
-            ack_delay: None,
-            ack_delay_timer: AckDelayTimer::Idle,
-            challenge_ack_timer: Instant::now(),
         }
     }
 }
@@ -400,11 +403,22 @@ impl Default for CongestionState {
 }
 
 /// Complete TCP State with all components
-#[derive(Debug, Default)]
-pub struct TcpState {
-    pub conn_mgmt: ConnectionManagement,
-    pub delivery: ReliableOrderedDelivery,
+#[derive(Debug)]
+pub struct TcpState<'a> {
+    pub conn_mgmt: ConnectionManagementState,
+    pub delivery: ReliableOrderedDeliveryState<'a>,
     pub flow_control: FlowControlState,
     pub congestion: Option<CongestionState>,  // Optional for now
     // pub demux: DemuxState,  // Add when needed
+}
+
+impl<'a> TcpState<'a> {
+    pub fn new(rx_buffer: SocketBuffer<'a>, tx_buffer: SocketBuffer<'a>) -> Self {
+        Self {
+            conn_mgmt: ConnectionManagementState::default(),
+            delivery: ReliableOrderedDeliveryState::new(rx_buffer, tx_buffer),
+            flow_control: FlowControlState::default(),
+            congestion: Some(CongestionState::default()),
+        }
+    }
 }
