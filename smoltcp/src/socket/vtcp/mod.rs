@@ -6,10 +6,10 @@ mod tests;
 
 pub use state::*;
 pub use events::*;
-
+use crate::time::Instant;
 use crate::socket::tcp::{SocketBuffer, State};
 use crate::socket::Context;
-use crate::wire::{IpRepr, IpProtocol, TcpRepr, TcpSeqNumber, TcpControl, Ipv4Repr, IpListenEndpoint, IpEndpoint};
+use crate::wire::{IpRepr, IpProtocol, TcpRepr, TcpSeqNumber, TcpControl, Ipv4Repr, IpListenEndpoint, IpEndpoint, IpAddress, TCP_HEADER_LEN};
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::Ipv6Repr;
 
@@ -23,6 +23,11 @@ impl<'a> Socket<'a> {
         Socket {
             state: TcpState::new(rx_buffer, tx_buffer),
         }
+    }
+
+    /// Return whether TCP Timestamp is enabled.
+    pub fn timestamp_enabled(&self) -> bool {
+        self.state.conn_mgmt.tsval_generator.is_some()
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -546,6 +551,168 @@ impl<'a> Socket<'a> {
         }
 
         (ip_reply_repr, reply_repr)
+    }
+
+    fn timed_out(&self, timestamp: Instant) -> bool {
+        match (self.state.conn_mgmt.remote_last_ts, self.state.conn_mgmt.timeout) {
+            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
+            (_, _) => false,
+        }
+    }
+
+    fn seq_to_transmit(&self, cx: &mut Context) -> bool {
+        let ip_header_len = match self.state.conn_mgmt.tuple.unwrap().local.addr {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
+        };
+
+        // Max segment size we're able to send due to MTU limitations.
+        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+
+        // The effective max segment size, taking into account our and remote's limits.
+        let effective_mss = local_mss.min(self.state.conn_mgmt.remote_mss);
+
+        // Have we sent data that hasn't been ACKed yet?
+        let data_in_flight = self.state.delivery.remote_last_seq != self.state.delivery.local_seq_no;
+
+        // If we want to send a SYN and we haven't done so, do it!
+        if matches!(self.state.conn_mgmt.tcp_state, State::SynSent | State::SynReceived) && !data_in_flight {
+            return true;
+        }
+
+        // max sequence number we can send.
+        let max_send_seq =
+            self.state.delivery.local_seq_no + core::cmp::min(self.state.flow_control.remote_win_len, self.state.delivery.tx_buffer.len());
+
+        // Max amount of octets we can send.
+        let max_send = if max_send_seq >= self.state.delivery.remote_last_seq {
+            max_send_seq - self.state.delivery.remote_last_seq
+        } else {
+            0
+        };
+
+        // Compare max_send with the congestion window.
+        // TODO: Angie did some weird hack on this
+        //let max_send = max_send.min(congestion::Controller::window(
+        //    self.state.congestion.congestion_controller.inner()
+        //));
+
+        // Can we send at least 1 octet?
+        let mut can_send = max_send != 0;
+        // Can we send at least 1 full segment?
+        let can_send_full = max_send >= effective_mss;
+
+        // Do we have to send a FIN?
+        let want_fin = match self.state.conn_mgmt.tcp_state {
+            State::FinWait1 => true,
+            State::Closing => true,
+            State::LastAck => true,
+            _ => false,
+        };
+
+        // If we're applying the Nagle algorithm we don't want to send more
+        // until one of:
+        // * There's no data in flight
+        // * We can send a full packet
+        // * We have all the data we'll ever send (we're closing send)
+        if self.state.congestion.nagle && data_in_flight && !can_send_full && !want_fin {
+            can_send = false;
+        }
+
+        // Can we actually send the FIN? We can send it if:
+        // 1. We have unsent data that fits in the remote window.
+        // 2. We have no unsent data.
+        // This condition matches only if #2, because #1 is already covered by can_data and we're ORing them.
+        let can_fin = want_fin && self.state.delivery.remote_last_seq == self.state.delivery.local_seq_no + self.state.delivery.tx_buffer.len();
+
+        can_send || can_fin
+    }
+
+    fn delayed_ack_expired(&self, timestamp: Instant) -> bool {
+        match self.state.delivery.ack_delay_timer {
+            AckDelayTimer::Idle => true,
+            AckDelayTimer::Waiting(t) => t <= timestamp,
+            AckDelayTimer::Immediate => true,
+        }
+    }
+
+    fn ack_to_transmit(&self) -> bool {
+        if let Some(remote_last_ack) = self.state.delivery.remote_last_ack {
+            remote_last_ack < self.state.delivery.remote_seq_no + self.state.delivery.rx_buffer.len()
+        } else {
+            false
+        }
+    }
+
+    /// Return whether to send ACK immediately due to the amount of unacknowledged data.
+    ///
+    /// RFC 9293 states "An ACK SHOULD be generated for at least every second full-sized segment or
+    /// 2*RMSS bytes of new data (where RMSS is the MSS specified by the TCP endpoint receiving the
+    /// segments to be acknowledged, or the default value if not specified) (SHLD-19)."
+    ///
+    /// Note that the RFC above only says "at least 2*RMSS bytes", which is not a hard requirement.
+    /// In practice, we follow the Linux kernel's empirical value of sending an ACK for every RMSS
+    /// byte of new data. For details, see
+    /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
+    fn immediate_ack_to_transmit(&self) -> bool {
+        if let Some(remote_last_ack) = self.state.delivery.remote_last_ack {
+            remote_last_ack + self.state.conn_mgmt.remote_mss < self.state.delivery.remote_seq_no + self.state.delivery.rx_buffer.len()
+        } else {
+            false
+        }
+    }
+
+    /// Return whether we should send ACK immediately due to significant window updates.
+    ///
+    /// ACKs with significant window updates should be sent immediately to let the sender know that
+    /// more data can be sent. According to the Linux kernel implementation, "significant" means
+    /// doubling the receive window. The Linux kernel implementation can be found at
+    /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
+    fn window_to_update(&self) -> bool {
+        match self.state.conn_mgmt.tcp_state {
+            State::SynSent
+            | State::SynReceived
+            | State::Established
+            | State::FinWait1
+            | State::FinWait2 => {
+                let new_win = self.scaled_window();
+                if let Some(last_win) = self.last_scaled_window() {
+                    new_win > 0 && new_win / 2 >= last_win
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+        /// Return the current window field value, including scaling according to RFC 1323.
+    ///
+    /// Used in internal calculations as well as packet generation.
+    #[inline]
+    fn scaled_window(&self) -> u16 {
+        u16::try_from(self.state.delivery.rx_buffer.window() >> self.state.flow_control.remote_win_shift).unwrap_or(u16::MAX)
+    }
+
+    /// Return the last window field value, including scaling according to RFC 1323.
+    ///
+    /// Used in internal calculations as well as packet generation.
+    ///
+    /// Unlike `remote_last_win`, we take into account new packets received (but not acknowledged)
+    /// since the last window update and adjust the window length accordingly. This ensures a fair
+    /// comparison between the last window length and the new window length we're going to
+    /// advertise.
+    #[inline]
+    fn last_scaled_window(&self) -> Option<u16> {
+        let last_ack = self.state.delivery.remote_last_ack?;
+        let next_ack = self.state.delivery.remote_seq_no + self.state.delivery.rx_buffer.len();
+
+        let last_win = (self.state.flow_control.remote_last_win as usize) << self.state.flow_control.remote_win_shift;
+        let last_win_adjusted = last_ack + last_win - next_ack;
+
+        Some(u16::try_from(last_win_adjusted >> self.state.flow_control.remote_win_shift).unwrap_or(u16::MAX))
     }
     
     // need to refactor, altering state

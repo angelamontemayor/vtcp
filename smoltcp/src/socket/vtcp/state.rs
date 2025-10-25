@@ -2,10 +2,10 @@ use crate::time::{Duration, Instant};
 
 use crate::socket::tcp::{SocketBuffer, State};
 use crate::socket::PollAt;
-use crate::wire::{TcpSeqNumber, IpEndpoint, IpListenEndpoint};
+use crate::wire::{TcpSeqNumber, IpEndpoint, IpListenEndpoint, TcpTimestampGenerator};
 use crate::storage::Assembler;
 
-mod congestion;
+pub mod congestion;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -26,6 +26,9 @@ pub struct ConnectionManagementState {
     pub hop_limit: Option<u8>,
     pub rx_fin_received: bool,
     pub challenge_ack_timer: Instant,     // Rate limiting timer
+    pub tsval_generator: Option<TcpTimestampGenerator>,
+    pub remote_last_ts: Option<Instant>,
+    pub remote_mss: usize,                // Remote max segment size
 }
 
 impl Default for ConnectionManagementState {
@@ -39,6 +42,9 @@ impl Default for ConnectionManagementState {
             hop_limit: None,
             rx_fin_received: false,
             challenge_ack_timer: Instant::now(),
+            tsval_generator: None,
+            remote_last_ts: None,
+            remote_mss: DEFAULT_MSS,
         }
     }
 }
@@ -356,7 +362,7 @@ impl<'a> ReliableOrderedDeliveryState<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum AckDelayTimer {
+pub enum AckDelayTimer {
     Idle,
     Waiting(Instant),
     Immediate,
@@ -386,7 +392,6 @@ impl Default for FlowControlState {
 #[derive(Debug)]
 pub struct CongestionState {
     pub congestion_controller: congestion::AnyController, // Reno/Cubic/None
-    pub remote_mss: usize,                // Remote max segment size
     pub nagle: bool,  
 }
 
@@ -396,7 +401,6 @@ impl Default for CongestionState {
     fn default() -> Self {
         Self {
             congestion_controller: congestion::AnyController::new(),
-            remote_mss: DEFAULT_MSS,
             nagle: true,
         }
     }
@@ -408,7 +412,7 @@ pub struct TcpState<'a> {
     pub conn_mgmt: ConnectionManagementState,
     pub delivery: ReliableOrderedDeliveryState<'a>,
     pub flow_control: FlowControlState,
-    pub congestion: Option<CongestionState>,  // Optional for now
+    pub congestion: CongestionState,
     // pub demux: DemuxState,  // Add when needed
 }
 
@@ -418,7 +422,7 @@ impl<'a> TcpState<'a> {
             conn_mgmt: ConnectionManagementState::default(),
             delivery: ReliableOrderedDeliveryState::new(rx_buffer, tx_buffer),
             flow_control: FlowControlState::default(),
-            congestion: Some(CongestionState::default()),
+            congestion: CongestionState::default(),
         }
     }
 }
