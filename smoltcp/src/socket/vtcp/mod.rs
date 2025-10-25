@@ -1,14 +1,15 @@
 mod state;
 mod events;
 
+#[cfg(test)]
+mod tests;
+
 pub use state::*;
 pub use events::*;
 
-use std::collections::VecDeque;
 use crate::socket::tcp::{SocketBuffer, State};
 use crate::socket::Context;
-use crate::wire::{IpRepr, IpProtocol, TcpRepr, TcpSeqNumber, TcpControl, Ipv4Repr};
-use crate::time::Instant;
+use crate::wire::{IpRepr, IpProtocol, TcpRepr, TcpSeqNumber, TcpControl, Ipv4Repr, IpListenEndpoint, IpEndpoint};
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::Ipv6Repr;
 
@@ -24,11 +25,147 @@ impl<'a> Socket<'a> {
         }
     }
 
+        /// Return the listen endpoint
+    #[inline]
+    pub fn listen_endpoint(&self) -> IpListenEndpoint {
+        self.state.conn_mgmt.listen_endpoint
+    }
+
+    /// Return the local endpoint, or None if not connected.
+    #[inline]
+    pub fn local_endpoint(&self) -> Option<IpEndpoint> {
+        Some(self.state.conn_mgmt.tuple?.local)
+    }
+
+    /// Return the remote endpoint, or None if not connected.
+    #[inline]
+    pub fn remote_endpoint(&self) -> Option<IpEndpoint> {
+        Some(self.state.conn_mgmt.tuple?.remote)
+    }
+
+    /// Return the connection state, in terms of the TCP state machine.
+    #[inline]
+    pub fn state(&self) -> State {
+        self.state.conn_mgmt.tcp_state
+    }
+    /// Return the maximum number of bytes inside the transmit buffer.
+    #[inline]
+    pub fn send_capacity(&self) -> usize {
+        self.state.delivery.tx_buffer.capacity()
+    }
+
+    /// Check whether the receive half of the full-duplex connection buffer is open
+    /// (see [may_recv](#method.may_recv)), and the receive buffer is not empty.
+    #[inline]
+    pub fn can_recv(&self) -> bool {
+        if !self.may_recv() {
+            return false;
+        }
+
+        !self.state.delivery.rx_buffer.is_empty()
+    }
+
+    /// Return whether the socket is open.
+    ///
+    /// This function returns true if the socket will process incoming or dispatch outgoing
+    /// packets. Note that this does not mean that it is possible to send or receive data through
+    /// the socket; for that, use [can_send](#method.can_send) or [can_recv](#method.can_recv).
+    ///
+    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`
+    /// or `TIME-WAIT` states.
+    #[inline]
+    pub fn is_open(&self) -> bool {
+        match self.state.conn_mgmt.tcp_state {
+            State::Closed => false,
+            State::TimeWait => false,
+            _ => true,
+        }
+    }
+
+    /// Return whether a connection is active.
+    ///
+    /// This function returns true if the socket is actively exchanging packets with
+    /// a remote endpoint. Note that this does not mean that it is possible to send or receive
+    /// data through the socket; for that, use [can_send](#method.can_send) or
+    /// [can_recv](#method.can_recv).
+    ///
+    /// If a connection is established, [abort](#method.close) will send a reset to
+    /// the remote endpoint.
+    ///
+    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`, `TIME-WAIT`,
+    /// or `LISTEN` state.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        match self.state.conn_mgmt.tcp_state {
+            State::Closed => false,
+            State::TimeWait => false,
+            State::Listen => false,
+            _ => true,
+        }
+    }
+
+    /// Return whether the receive half of the full-duplex connection is open.
+    ///
+    /// This function returns true if it's possible to receive data from the remote endpoint.
+    /// It will return true while there is data in the receive buffer, and if there isn't,
+    /// as long as the remote endpoint has not closed the connection.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED`,
+    /// `FIN-WAIT-1`, or `FIN-WAIT-2` state, or have data in the receive buffer instead.
+    #[inline]
+    pub fn may_recv(&self) -> bool {
+        match self.state.conn_mgmt.tcp_state {
+            State::Established => true,
+            // In FIN-WAIT-1/2, we have closed our transmit half of the connection but
+            // we still can receive indefinitely.
+            State::FinWait1 | State::FinWait2 => true,
+            // If we have something in the receive buffer, we can receive that.
+            _ if !self.state.delivery.rx_buffer.is_empty() => true,
+            _ => false,
+        }
+    }
+
+    /// Return whether the transmit half of the full-duplex connection is open.
+    ///
+    /// This function returns true if it's possible to send data and have it arrive
+    /// to the remote endpoint. However, it does not make any guarantees about the state
+    /// of the transmit buffer, and even if it returns true, [send](#method.send) may
+    /// not be able to enqueue any octets.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED` or
+    /// `CLOSE-WAIT` state.
+    #[inline]
+    pub fn may_send(&self) -> bool {
+        match self.state.conn_mgmt.tcp_state {
+            State::Established => true,
+            // In CLOSE-WAIT, the remote endpoint has closed our receive half of the connection
+            // but we still can transmit indefinitely.
+            State::CloseWait => true,
+            _ => false,
+        }
+    }
+
+    /// Check whether the transmit half of the full-duplex connection is open
+    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        if !self.may_send() {
+            return false;
+        }
+
+        !self.state.delivery.tx_buffer.is_full()
+    }
+
+
+    fn process_conn_mgmt_events(conn_state: &mut ConnectionManagementState, events: Vec<ConnectionEvent>) {
+        
+    }
+
     fn process_rx_rod_events(rod_state: &mut ReliableOrderedDeliveryState,
         events: Vec<DeliveryEvent>) {
         for event in events {
             match event {
-                DeliveryEvent::InOrderData { seq, data } => {
+                DeliveryEvent::InOrderData { seq: _, data } => {
                                 let offset = 0;
                                 let payload_len = data.len();
                 
@@ -258,7 +395,6 @@ impl<'a> Socket<'a> {
         } else {
             return None;
         }
-        None
     }
     
     fn process_data(&mut self, repr: &TcpRepr) {
@@ -327,6 +463,7 @@ impl<'a> Socket<'a> {
         );
         (ip_reply_repr, reply_repr)
     }
+
     /* 
     fn ack_reply(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
@@ -389,8 +526,12 @@ impl<'a> Socket<'a> {
     } */
 
     pub(crate) fn rst_reply(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
+        debug_assert!(repr.control != TcpControl::Rst);
+
         let (ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
 
+        // See https://www.snellman.net/blog/archive/2016-02-01-tcp-rst/ for explanation
+        // of why we sometimes send an RST and sometimes an RST|ACK
         reply_repr.control = TcpControl::Rst;
         reply_repr.seq_number = repr.ack_number.unwrap_or_default();
         if repr.control == TcpControl::Syn && repr.ack_number.is_none() {
@@ -448,13 +589,20 @@ impl<'a> Socket<'a> {
         }
     }
     
+    // need to refactor, altering state
     pub fn set_sequence_numbers(&mut self, remote_seq_no: u32, local_seq_no: u32) {
         self.state.delivery.remote_seq_no = TcpSeqNumber(remote_seq_no.try_into().unwrap());
         self.state.delivery.local_seq_no = TcpSeqNumber(local_seq_no.try_into().unwrap());
     }
-    
+
+    // need to refactor, altering state, rn only used in tests
     pub fn set_state(&mut self, state: crate::socket::tcp::State) {
         self.state.conn_mgmt.tcp_state = state;
+    }
+
+    // need to refactor, altering state, rn only used in tests
+    pub fn set_tuple(&mut self, tuple: Tuple) {
+        self.state.conn_mgmt.tuple = Some(tuple);
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::wire::{TcpSeqNumber, TcpControl};
 use crate::socket::tcp::State;
 use crate::time::Instant;
+use super::state::Tuple;
 
 /// Events for Reliable & Ordered Delivery component
 #[derive(Debug)]
@@ -29,7 +30,12 @@ pub enum CongestionEvent {
     Timeout { now: Instant },
 }
 
-/// Control events (can modify all state)
+pub enum ConnectionEvent {
+    NewState {state: State},
+    NewTuple {tuple: Tuple},
+}
+
+// Control events (can modify all state)
 #[derive(Debug)]
 pub enum ControlEvent {
     ControlPacket { 
