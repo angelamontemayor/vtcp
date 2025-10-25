@@ -66,6 +66,12 @@ impl<'a> Socket<'a> {
         self.state.delivery.tx_buffer.capacity()
     }
 
+    /// Return the maximum number of bytes inside the recv buffer.
+    #[inline]
+    pub fn recv_capacity(&self) -> usize {
+        self.state.delivery.rx_buffer.capacity()
+    }
+
     /// Check whether the receive half of the full-duplex connection buffer is open
     /// (see [may_recv](#method.may_recv)), and the receive buffer is not empty.
     #[inline]
@@ -75,6 +81,17 @@ impl<'a> Socket<'a> {
         }
 
         !self.state.delivery.rx_buffer.is_empty()
+    }
+
+    /// Return whether the socket is passively listening for incoming connections.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `LISTEN` state.
+    #[inline]
+    pub fn is_listening(&self) -> bool {
+        match self.state.conn_mgmt.tcp_state {
+            State::Listen => true,
+            _ => false,
+        }
     }
 
     /// Return whether the socket is open.
@@ -114,6 +131,22 @@ impl<'a> Socket<'a> {
             State::Listen => false,
             _ => true,
         }
+    }
+
+    /// Return the amount of octets queued in the transmit buffer.
+    ///
+    /// Note that the Berkeley sockets interface does not have an equivalent of this API.
+    pub fn send_queue(&self) -> usize {
+        self.state.delivery.tx_buffer.len()
+    }
+
+    /// Return the amount of octets queued in the receive buffer. This value can be larger than
+    /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
+    /// and not only the octets that may be returned as a contiguous slice.
+    ///
+    /// Note that the Berkeley sockets interface does not have an equivalent of this API.
+    pub fn recv_queue(&self) -> usize {
+        self.state.delivery.rx_buffer.len()
     }
 
     /// Return whether the receive half of the full-duplex connection is open.
@@ -713,22 +746,6 @@ impl<'a> Socket<'a> {
         let last_win_adjusted = last_ack + last_win - next_ack;
 
         Some(u16::try_from(last_win_adjusted >> self.state.flow_control.remote_win_shift).unwrap_or(u16::MAX))
-    }
-    
-    // need to refactor, altering state
-    pub fn set_sequence_numbers(&mut self, remote_seq_no: u32, local_seq_no: u32) {
-        self.state.delivery.remote_seq_no = TcpSeqNumber(remote_seq_no.try_into().unwrap());
-        self.state.delivery.local_seq_no = TcpSeqNumber(local_seq_no.try_into().unwrap());
-    }
-
-    // need to refactor, altering state, rn only used in tests
-    pub fn set_state(&mut self, state: crate::socket::tcp::State) {
-        self.state.conn_mgmt.tcp_state = state;
-    }
-
-    // need to refactor, altering state, rn only used in tests
-    pub fn set_tuple(&mut self, tuple: Tuple) {
-        self.state.conn_mgmt.tuple = Some(tuple);
     }
 }
 

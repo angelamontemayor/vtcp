@@ -72,70 +72,54 @@ mod tests {
         }
     }
 
-    fn socket_established() -> TestSocket {
-        let mut s = socket();
-        // Set up established state - matching socket_established() in tcp.rs
-        s.socket.set_state(State::Established);
-        s.socket.set_sequence_numbers(REMOTE_SEQ.0 as u32 + 1, LOCAL_SEQ.0 as u32 + 1);
+    const TUPLE: Tuple = Tuple {
+        local: IpEndpoint {
+            addr: IpAddress::Ipv4(LOCAL_ADDR),
+            port: LOCAL_PORT,
+        },
+        remote: IpEndpoint {
+            addr: IpAddress::Ipv4(REMOTE_ADDR),
+            port: REMOTE_PORT,
+        },
+    };
 
-        // Set up the connection tuple
-        let tuple = Tuple {
-            local: IpEndpoint {
-                addr: IpAddress::Ipv4(LOCAL_ADDR),
-                port: LOCAL_PORT,
-            },
-            remote: IpEndpoint {
-                addr: IpAddress::Ipv4(REMOTE_ADDR),
-                port: REMOTE_PORT,
-            },
-        };
-        s.socket.set_tuple(tuple);
-
-        // Initialize remote window - matching tcp.rs
+    fn socket_syn_received_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
+        let mut s = socket_with_buffer_sizes(tx_len, rx_len);
+        s.socket.state.conn_mgmt.tcp_state = State::SynReceived;
+        s.socket.state.conn_mgmt.tuple = Some(TUPLE);
+        s.socket.state.delivery.remote_seq_no = REMOTE_SEQ + 1;
+        s.socket.state.delivery.local_seq_no = LOCAL_SEQ;
         s.socket.state.flow_control.remote_win_len = 256;
-
         s
     }
 
     fn socket_syn_received() -> TestSocket {
-        let mut s = socket();
-        s.socket.set_state(State::SynReceived);
+        socket_syn_received_with_buffer_sizes(64, 64)
+    }
 
-        let tuple = Tuple {
-            local: IpEndpoint {
-                addr: IpAddress::Ipv4(LOCAL_ADDR),
-                port: LOCAL_PORT,
-            },
-            remote: IpEndpoint {
-                addr: IpAddress::Ipv4(REMOTE_ADDR),
-                port: REMOTE_PORT,
-            },
-        };
-        s.socket.set_tuple(tuple);
-
-        s.socket.set_sequence_numbers(REMOTE_SEQ.0 as u32 + 1, LOCAL_SEQ.0 as u32);
-        s.socket.state.flow_control.remote_win_len = 256;
+    fn socket_syn_sent_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
+        let mut s = socket_with_buffer_sizes(tx_len, rx_len);
+        s.socket.state.conn_mgmt.tcp_state = State::SynSent;
+        s.socket.state.conn_mgmt.tuple = Some(TUPLE);
+        s.socket.state.delivery.local_seq_no = LOCAL_SEQ;
         s
     }
 
     fn socket_syn_sent() -> TestSocket {
-        let mut s = socket();
-        s.socket.set_state(State::SynSent);
+        socket_syn_sent_with_buffer_sizes(64, 64)
+    }
 
-        let tuple = Tuple {
-            local: IpEndpoint {
-                addr: IpAddress::Ipv4(LOCAL_ADDR),
-                port: LOCAL_PORT,
-            },
-            remote: IpEndpoint {
-                addr: IpAddress::Ipv4(REMOTE_ADDR),
-                port: REMOTE_PORT,
-            },
-        };
-        s.socket.set_tuple(tuple);
-
-        s.socket.set_sequence_numbers(0, LOCAL_SEQ.0 as u32);
+    fn socket_established_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
+        let mut s = socket_syn_received_with_buffer_sizes(tx_len, rx_len);
+        s.socket.state.conn_mgmt.tcp_state = State::Established;
+        s.socket.state.delivery.remote_seq_no = REMOTE_SEQ + 1;
+        s.socket.state.delivery.local_seq_no = LOCAL_SEQ + 1;
+        s.socket.state.delivery.remote_last_seq = LOCAL_SEQ + 1;
         s
+    }
+
+    fn socket_established() -> TestSocket {
+        socket_established_with_buffer_sizes(64, 64)
     }
 
     // =========================================================================================//
@@ -148,7 +132,7 @@ mod tests {
         let mut s = socket();
         // Note: In vtcp, we need to explicitly set state to Closed
         // (tcp.rs socket defaults to Closed, vtcp defaults to Established)
-        s.socket.set_state(State::Closed);
+        s.socket.state.conn_mgmt.tcp_state = State::Closed;
         assert_eq!(s.socket.state.conn_mgmt.tcp_state, State::Closed);
 
         let tcp_repr = TcpRepr {
@@ -514,22 +498,7 @@ mod tests {
         //
         // What we CAN test: Basic reassembly with buffer constraints
 
-        let mut s = socket_with_buffer_sizes(64, 10);  // Larger buffer to avoid overflow
-        s.socket.set_state(State::Established);
-        s.socket.set_sequence_numbers(REMOTE_SEQ.0 as u32 + 1, LOCAL_SEQ.0 as u32 + 1);
-
-        let tuple = Tuple {
-            local: IpEndpoint {
-                addr: IpAddress::Ipv4(LOCAL_ADDR),
-                port: LOCAL_PORT,
-            },
-            remote: IpEndpoint {
-                addr: IpAddress::Ipv4(REMOTE_ADDR),
-                port: REMOTE_PORT,
-            },
-        };
-        s.socket.set_tuple(tuple);
-        s.socket.state.flow_control.remote_win_len = 256;
+        let mut s = socket_established_with_buffer_sizes(64, 10);
 
         // Send first chunk
         let tcp_repr1 = TcpRepr {
