@@ -23,7 +23,7 @@ pub struct ConnectionManagementState {
     pub tuple: Option<Tuple>,
     pub timeout: Option<Duration>,
     pub keep_alive: Option<Duration>,
-    pub hop_limit: Option<Duration>,
+    pub hop_limit: Option<u8>,
     pub rx_fin_received: bool,
     pub challenge_ack_timer: Instant,     // Rate limiting timer
 }

@@ -25,7 +25,14 @@ impl<'a> Socket<'a> {
         }
     }
 
-        /// Return the listen endpoint
+    /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
+    ///
+    /// See also the [set_hop_limit](#method.set_hop_limit) method
+    pub fn hop_limit(&self) -> Option<u8> {
+        self.state.conn_mgmt.hop_limit
+    }
+
+    /// Return the listen endpoint
     #[inline]
     pub fn listen_endpoint(&self) -> IpListenEndpoint {
         self.state.conn_mgmt.listen_endpoint
@@ -539,54 +546,6 @@ impl<'a> Socket<'a> {
         }
 
         (ip_reply_repr, reply_repr)
-    }
-
-    fn create_ack_packet(
-        &self,
-        ip_repr: &IpRepr,
-        tcp_repr: &TcpRepr,
-        seq: TcpSeqNumber,
-        ack: TcpSeqNumber,
-        window: u16,
-    ) -> (IpRepr, TcpRepr<'static>) {
-        let ack_repr = TcpRepr {
-            src_port: tcp_repr.dst_port,
-            dst_port: tcp_repr.src_port,
-            control: TcpControl::None,
-            seq_number: seq,
-            ack_number: Some(ack),
-            window_len: window,
-            window_scale: None,
-            max_seg_size: None,
-            sack_permitted: false,
-            sack_ranges: [None, None, None],
-            timestamp: None,
-            payload: &[],
-        };
-        
-        let response_ip = self.swap_ip_addresses(ip_repr, ack_repr.buffer_len());
-        (response_ip, ack_repr)
-    }
-    
-    fn swap_ip_addresses(&self, ip_repr: &IpRepr, payload_len: usize) -> IpRepr {
-        match ip_repr {
-            IpRepr::Ipv4(ipv4_repr) => IpRepr::Ipv4(Ipv4Repr {
-                src_addr: ipv4_repr.dst_addr,
-                dst_addr: ipv4_repr.src_addr,
-                next_header: IpProtocol::Tcp,
-                payload_len,
-                hop_limit: 64,
-            }),
-            #[cfg(feature = "proto-ipv6")]
-            IpRepr::Ipv6(ipv6_repr) => IpRepr::Ipv6(Ipv6Repr {
-                src_addr: ipv6_repr.dst_addr,
-                dst_addr: ipv6_repr.src_addr,
-                next_header: IpProtocol::Tcp,
-                payload_len,
-                hop_limit: 64,
-            }),
-            _ => ip_repr.clone(),
-        }
     }
     
     // need to refactor, altering state
